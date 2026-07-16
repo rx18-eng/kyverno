@@ -756,40 +756,35 @@ func main() {
 				setup.Logger.Error(err, "failed to create policy provider")
 				os.Exit(1)
 			}
+			// A namespaced request whose namespace is missing from a synced cache is not expected.
+			// The engines fall back to a minimal namespace so CEL still evaluates, which means a
+			// policy selecting on namespace labels quietly stops matching, so log the miss rather
+			// than let it surface later as a policy that silently stopped applying.
+			nsResolver := func(name string) *corev1.Namespace {
+				ns, err := nsLister.Get(name)
+				if err != nil {
+					setup.Logger.Error(err, "failed to resolve namespace, policies matching on namespace labels may not apply to this request", "namespace", name)
+					return nil
+				}
+				return ns
+			}
+
 			vpolEngine = vpolengine.NewMetricWrapper(vpolengine.NewEngine(
 				vpolProvider,
-				func(name string) *corev1.Namespace {
-					ns, err := nsLister.Get(name)
-					if err != nil {
-						return nil
-					}
-					return ns
-				},
+				nsResolver,
 				matching.NewMatcher(),
 			), metrics.AdmissionRequest)
 
 			ivpolEngine = ivpolengine.NewMetricWrapper(ivpolengine.NewEngine(
 				ivpolProvider,
-				func(name string) *corev1.Namespace {
-					ns, err := nsLister.Get(name)
-					if err != nil {
-						return nil
-					}
-					return ns
-				},
+				nsResolver,
 				matching.NewMatcher(),
 				setup.KubeClient.CoreV1().Secrets(config.KyvernoNamespace()),
 				nil,
 			), metrics.AdmissionRequest)
 			mpolEngine = mpolengine.NewMetricWrapper(mpolengine.NewEngine(
 				mpolProvider,
-				func(name string) *corev1.Namespace {
-					ns, err := nsLister.Get(name)
-					if err != nil {
-						return nil
-					}
-					return ns
-				},
+				nsResolver,
 				matching.NewMatcher(),
 				typeConverter,
 				contextProvider,

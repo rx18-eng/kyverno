@@ -61,6 +61,22 @@ func PodAdmissionRequest(name, namespace string, raw []byte) handlers.AdmissionR
 	}
 }
 
+// CronJobAdmissionRequest builds a handlers.AdmissionRequest for a CronJob CREATE operation.
+func CronJobAdmissionRequest(name, namespace string, raw []byte) handlers.AdmissionRequest {
+	return handlers.AdmissionRequest{
+		AdmissionRequest: admissionv1.AdmissionRequest{
+			UID:       types.UID(uuid.New().String()),
+			Operation: admissionv1.Create,
+			Resource:  metav1.GroupVersionResource{Group: "batch", Version: "v1", Resource: "cronjobs"},
+			Kind:      metav1.GroupVersionKind{Group: "batch", Version: "v1", Kind: "CronJob"},
+			Name:      name,
+			Namespace: namespace,
+			Object:    runtime.RawExtension{Raw: raw},
+			UserInfo:  authenticationv1.UserInfo{Username: "test-user"},
+		},
+	}
+}
+
 // ContextWithPolicies injects policy names into the context using httprouter params,
 // matching how the real webhook server passes policy names to handlers.
 func ContextWithPolicies(ctx context.Context, policyNames ...string) context.Context {
@@ -163,18 +179,44 @@ func PodMatchRulesWithOps(ops ...admissionregistrationv1.OperationType) *admissi
 	}
 }
 
+// CronJobMatchRules returns MatchResources that match cronjobs on CREATE operations.
+func CronJobMatchRules() *admissionregistrationv1.MatchResources {
+	return &admissionregistrationv1.MatchResources{
+		ResourceRules: []admissionregistrationv1.NamedRuleWithOperations{{
+			RuleWithOperations: admissionregistrationv1.RuleWithOperations{
+				Operations: []admissionregistrationv1.OperationType{admissionregistrationv1.Create},
+				Rule: admissionregistrationv1.Rule{
+					APIGroups:   []string{"batch"},
+					APIVersions: []string{"v1"},
+					Resources:   []string{"cronjobs"},
+				},
+			},
+		}},
+	}
+}
+
 // CreateNamespace creates a namespace in the envtest cluster and registers cleanup.
 // Explicitly sets the well-known "kubernetes.io/metadata.name" label because envtest
 // does not always inject it (kube-controller-manager is not running), which breaks
 // any policy that relies on NamespaceSelector matching by namespace name.
 func CreateNamespace(t *testing.T, kubeClient kubernetes.Interface, name string) {
 	t.Helper()
+	CreateNamespaceWithLabels(t, kubeClient, name, nil)
+}
+
+// CreateNamespaceWithLabels creates a namespace carrying the given labels, for policies that select
+// namespaces by label or read namespaceObject.metadata.labels. The kubernetes.io/metadata.name
+// label is always set, as above; labels passed here are applied on top.
+func CreateNamespaceWithLabels(t *testing.T, kubeClient kubernetes.Interface, name string, labels map[string]string) {
+	t.Helper()
+	allLabels := map[string]string{"kubernetes.io/metadata.name": name}
+	for k, v := range labels {
+		allLabels[k] = v
+	}
 	ns := &corev1.Namespace{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: name,
-			Labels: map[string]string{
-				"kubernetes.io/metadata.name": name,
-			},
+			Name:   name,
+			Labels: allLabels,
 		},
 	}
 	_, err := kubeClient.CoreV1().Namespaces().Create(context.Background(), ns, metav1.CreateOptions{})

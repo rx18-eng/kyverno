@@ -78,8 +78,8 @@ func (e *engineImpl) Handle(request engine.EngineRequest, policy Policy, cacheRe
 	)
 	// resolve namespace
 	var namespace runtime.Object
-	if ns := request.Request.Namespace; ns != "" {
-		namespace = e.nsResolver(ns)
+	if ns := engine.ResolveNamespace(e.nsResolver, request.Request.Namespace); ns != nil {
+		namespace = ns
 	}
 
 	startTime := time.Now()

@@ -68,7 +68,7 @@ func (e *Engine) Handle(ctx context.Context, policy Policy, resource unstructure
 		)
 
 		if namespace != "" {
-			ns = e.nsResolver(namespace)
+			ns = engine.ResolveNamespace(e.nsResolver, namespace)
 		} else if resource.GroupVersionKind().Group == "" && resource.GetKind() == "Namespace" {
 			// For Namespace resources (cluster-scoped), build ns from the resource itself so
 			// that namespaceSelector and namespaceObject work correctly even when the resolver

@@ -104,8 +104,8 @@ func (e *engineImpl) HandleValidating(ctx context.Context, request EngineRequest
 	)
 	// resolve namespace
 	var namespace runtime.Object
-	if ns := request.Request.Namespace; ns != "" {
-		namespace = e.nsResolver(ns)
+	if ns := engine.ResolveNamespace(e.nsResolver, request.Request.Namespace); ns != nil {
+		namespace = ns
 	}
 	// evaluate policies
 	var relevant []Policy
@@ -164,8 +164,8 @@ func (e *engineImpl) HandleMutating(ctx context.Context, request EngineRequest, 
 	)
 	// resolve namespace
 	var namespace runtime.Object
-	if ns := request.Request.Namespace; ns != "" {
-		namespace = e.nsResolver(ns)
+	if ns := engine.ResolveNamespace(e.nsResolver, request.Request.Namespace); ns != nil {
+		namespace = ns
 	}
 	// evaluate policies
 	var relevant []Policy

@@ -8,7 +8,6 @@ import (
 	"github.com/kyverno/kyverno/pkg/cel/matching"
 	vpolcompiler "github.com/kyverno/kyverno/pkg/cel/policies/vpol/compiler"
 	vpolengine "github.com/kyverno/kyverno/pkg/cel/policies/vpol/engine"
-	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -24,7 +23,7 @@ func NewVpolEngine(mgr ctrl.Manager) (vpolengine.Engine, vpolengine.Provider, er
 		return nil, nil, err
 	}
 
-	nsResolver := func(ns string) *corev1.Namespace { return nil }
+	nsResolver := newNamespaceResolver(mgr)
 	matcher := matching.NewMatcher()
 
 	return vpolengine.NewEngine(provider, nsResolver, matcher), provider, nil
@@ -67,7 +66,7 @@ func NewVpolEngineWithExceptions(mgr ctrl.Manager) (vpolengine.Engine, vpolengin
 		return nil, nil, err
 	}
 
-	nsResolver := func(ns string) *corev1.Namespace { return nil }
+	nsResolver := newNamespaceResolver(mgr)
 	matcher := matching.NewMatcher()
 
 	return vpolengine.NewEngine(provider, nsResolver, matcher), provider, nil

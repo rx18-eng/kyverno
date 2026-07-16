@@ -10,7 +10,6 @@ import (
 	mpolengine "github.com/kyverno/kyverno/pkg/cel/policies/mpol/engine"
 	kyvernoclient "github.com/kyverno/kyverno/pkg/client/clientset/versioned"
 	kyvernoinformer "github.com/kyverno/kyverno/pkg/client/informers/externalversions"
-	corev1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/kubernetes"
 	ctrl "sigs.k8s.io/controller-runtime"
 )
@@ -38,7 +37,7 @@ func newMpolEngine(ctx context.Context, mgr ctrl.Manager, kubeClient kubernetes.
 		return nil, nil, err
 	}
 
-	nsResolver := func(ns string) *corev1.Namespace { return nil }
+	nsResolver := newNamespaceResolver(mgr)
 	matcher := matching.NewMatcher()
 
 	return mpolengine.NewEngine(provider, nsResolver, matcher, typeConverter, contextProvider), provider, nil

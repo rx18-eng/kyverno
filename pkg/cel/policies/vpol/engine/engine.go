@@ -91,8 +91,8 @@ func (e *engineImpl) Handle(ctx context.Context, request EngineRequest, predicat
 	)
 	// resolve namespace
 	var namespace runtime.Object
-	if ns := request.Request.Namespace; ns != "" {
-		namespace = e.nsResolver(ns)
+	if ns := engine.ResolveNamespace(e.nsResolver, request.Request.Namespace); ns != nil {
+		namespace = ns
 	}
 	// evaluate policies
 	for _, policy := range policies {

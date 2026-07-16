@@ -146,10 +146,7 @@ func (e *engineImpl) Handle(ctx context.Context, request engine.EngineRequest, p
 		admissionpolicy.NewUser(request.Request.UserInfo),
 	)
 
-	var namespace *corev1.Namespace
-	if ns := request.Request.Namespace; ns != "" {
-		namespace = e.nsResolver(ns)
-	}
+	namespace := engine.ResolveNamespace(e.nsResolver, request.Request.Namespace)
 
 	for _, mpol := range mpols {
 		if predicate != nil && !predicate(mpol.Policy) {
@@ -318,10 +315,7 @@ func (e *engineImpl) MatchedMutateExistingPolicies(ctx context.Context, request 
 		admissionpolicy.NewUser(request.Request.UserInfo),
 	)
 
-	var namespace *corev1.Namespace
-	if ns := request.Request.Namespace; ns != "" {
-		namespace = e.nsResolver(ns)
-	}
+	namespace := engine.ResolveNamespace(e.nsResolver, request.Request.Namespace)
 
 	return e.provider.MatchesMutateExisting(ctx, attr, &request.Request, namespace)
 }
