@@ -21,7 +21,8 @@ jobs:
       - name: Checkout kyverno/policies
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          repository: kyverno/policies
+          repository: anushkagupta200615-jpg/policies # TEST-ONLY: kyverno/policies#1542 head
+          ref: f55fcad8835a1391361d1d655e8864960d856fff
           path: policies
       # install tools
       - name: Install tools
