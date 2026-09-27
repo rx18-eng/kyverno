@@ -422,3 +422,5 @@ require (
 )
 
 replace k8s.io/pod-security-admission => github.com/kyverno/pod-security-admission v0.0.0-20251031094455-46f20778634f
+
+replace github.com/kyverno/sdk => github.com/rx18-eng/sdk v0.0.0-20260927212939-95095d47830d
