@@ -4,6 +4,7 @@ import (
 	"context"
 	"sync"
 	"testing"
+	"time"
 
 	policiesv1beta1 "github.com/kyverno/api/api/policies.kyverno.io/v1beta1"
 	kyvernov1 "github.com/kyverno/kyverno/api/kyverno/v1"
@@ -19,6 +20,7 @@ import (
 	reportutils "github.com/kyverno/kyverno/pkg/utils/report"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	admissionv1 "k8s.io/api/admission/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -296,6 +298,241 @@ func TestProcessUR_ConcurrentCacheRestoreAndGenerateExistingDoesNotDeleteDownstr
 	defer wm.lock.Unlock()
 	assert.Len(t, client.deleted, 0)
 	assert.Contains(t, wm.dynamicWatchers[configMapGVR].metadataCache, downstream.GetUID())
+}
+
+// TestDynamicWatcher_HandleUpdateRevertsOwnWriteDuringStaleCacheWindow is the
+// first half of the gpol clone/sync race behind the chainsaw scenario
+// generating-policies/clone/sync/sync-modify-trigger: it proves the defect
+// mechanism in dynamic_watcher.go's handleUpdate in isolation, deterministically
+// and without any goroutine scheduling. handleUpdate has no way to distinguish
+// "the cache is stale because a legitimate Kyverno write hasn't been synced into
+// it yet" from "a user modified the downstream out of band" -- both look like a
+// hash mismatch against whatever is currently cached, and both are reverted
+// (dynamic_watcher.go:576 "downstream resource updated by user, reverting
+// changes"). generate_controller.go's ProcessUR is what can leave the cache in
+// exactly that first state (see the sibling test below), so this is the
+// mechanism that turns that window into data loss.
+func TestDynamicWatcher_HandleUpdateRevertsOwnWriteDuringStaleCacheWindow(t *testing.T) {
+	secretGVR := schema.GroupVersionResource{Group: "", Version: "v1", Resource: "secrets"}
+	downstreamOld := makeUnstructured("", "", "v1", "Secret", "sync-modify-trigger", "sync-modify-trigger", "downstream-uid", map[string]string{
+		common.GeneratePolicyLabel:     "test-gpol-sync-race",
+		common.GenerateTriggerUIDLabel: "trigger-uid",
+	})
+	require.NoError(t, unstructured.SetNestedField(downstreamOld.Object, "YmFy", "data", "foo")) // base64("bar")
+	downstreamNew := downstreamOld.DeepCopy()
+	require.NoError(t, unstructured.SetNestedField(downstreamNew.Object, "Z2l0bGFi", "data", "foo")) // base64("gitlab")
+
+	client := &MockClient{}
+	wm := &WatchManager{
+		client: client,
+		dynamicWatchers: map[schema.GroupVersionResource]*watcher{
+			secretGVR: {
+				watcher: watch.NewFake(),
+				metadataCache: map[types.UID]Resource{
+					// The cache still holds the OLD hash: this is the exact
+					// state that exists between engine.Handle's write and
+					// SyncWatchers refreshing the cache for it.
+					downstreamOld.GetUID(): {
+						Name:      downstreamOld.GetName(),
+						Namespace: downstreamOld.GetNamespace(),
+						Labels:    downstreamOld.GetLabels(),
+						Hash:      reportutils.CalculateResourceHash(*downstreamOld),
+						Data:      downstreamOld,
+					},
+				},
+			},
+		},
+		log: logging.WithName("test-watch-manager"),
+	}
+
+	// The watch event for Kyverno's own write (the new content) arrives while
+	// the cache is still stale.
+	wm.handleUpdate(downstreamNew.DeepCopy(), secretGVR)
+
+	assert.NotEmpty(t, client.updated, "handleUpdate must revert a hash mismatch while the cache is stale -- this is the defect: it cannot tell a pending Kyverno write apart from real user tampering")
+}
+
+// TestProcessUR_SyncWatchersMustCompleteBeforeReturn is the second half of the
+// same race: it proves ProcessUR (generate_controller.go) actually leaves the
+// watcher cache in the stale state the test above exploits, because it
+// dispatches SyncWatchers in a goroutine (`go func(...) { c.watchManager.
+// SyncWatchers(...) }`) instead of calling it inline before returning.
+//
+// This does NOT race real wall-clock time against a fixed sleep (an earlier
+// version of this test did exactly that, comparing "elapsed" against the
+// mock's delay, and was flaky under load: ~15/20 runs correctly caught the
+// bug, but ~5/20 falsely passed because scheduling jitter let the background
+// goroutine finish before the assertion ran). Instead it proves a dependency,
+// not a timing window: the mocked RESTMapper blocks on a channel that only
+// the test controls, and is never released until AFTER we've already
+// observed whether ProcessUR returned. If ProcessUR returns anyway, that
+// deterministically proves it does not wait for SyncWatchers, regardless of
+// CPU contention. No channel/lock coordination with handleUpdate is needed
+// (and must be avoided: SyncWatchers holds wm.lock for its whole body, so
+// calling handleUpdate, which also needs wm.lock, while SyncWatchers is
+// deliberately stalled inside that body would deadlock both goroutines --
+// the mistake in that same earlier version).
+func TestProcessUR_SyncWatchersMustCompleteBeforeReturn(t *testing.T) {
+	// needsReports (called at the end of ProcessUR) dereferences the global
+	// reporting configuration; set it explicitly for this test and restore the
+	// previous value afterwards, mirroring TestProcessUR_ErrorResultMarksURFailed
+	// below.
+	prevReportingCfg := reportutils.ReportingCfg
+	reportutils.ReportingCfg = reportutils.NewReportingConfig(nil)
+	t.Cleanup(func() { reportutils.ReportingCfg = prevReportingCfg })
+
+	policyName := "test-gpol-sync-race"
+	secretGVR := schema.GroupVersionResource{Group: "", Version: "v1", Resource: "secrets"}
+
+	trigger := makeUnstructured("1", "", "v1", "Secret", "sync-modify-trigger", "default", "trigger-uid", map[string]string{
+		"argocd.argoproj.io/secret-type": "repository",
+	})
+
+	downstreamOld := makeUnstructured("", "", "v1", "Secret", "sync-modify-trigger", "sync-modify-trigger", "downstream-uid", map[string]string{
+		common.GeneratePolicyLabel:     policyName,
+		common.GenerateTriggerUIDLabel: string(trigger.GetUID()),
+	})
+	require.NoError(t, unstructured.SetNestedField(downstreamOld.Object, "YmFy", "data", "foo")) // base64("bar")
+	downstreamNew := downstreamOld.DeepCopy()
+	require.NoError(t, unstructured.SetNestedField(downstreamNew.Object, "Z2l0bGFi", "data", "foo")) // base64("gitlab")
+
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	unblockMock := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(unblockMock) // never leak the blocked goroutine past this test, on any exit path
+
+	mapper := &mockRESTMapper{fn: func(gk schema.GroupKind, version string) (*meta.RESTMapping, error) {
+		if gk.Group != "" || gk.Kind != "Secret" {
+			return nil, assert.AnError
+		}
+		<-release
+		return &meta.RESTMapping{Resource: secretGVR}, nil
+	}}
+
+	client := &triggerClient{MockClient: &MockClient{}, trigger: trigger}
+	wm := &WatchManager{
+		client:     client,
+		restMapper: mapper,
+		dynamicWatchers: map[schema.GroupVersionResource]*watcher{
+			secretGVR: {
+				watcher: watch.NewFake(),
+				metadataCache: map[types.UID]Resource{
+					downstreamOld.GetUID(): {
+						Name:      downstreamOld.GetName(),
+						Namespace: downstreamOld.GetNamespace(),
+						Labels:    downstreamOld.GetLabels(),
+						Hash:      reportutils.CalculateResourceHash(*downstreamOld),
+						Data:      downstreamOld,
+					},
+				},
+			},
+		},
+		policyRefs: map[string][]schema.GroupVersionResource{policyName: {secretGVR}},
+		refCount:   map[schema.GroupVersionResource]int{secretGVR: 1},
+		log:        logging.WithName("test-watch-manager"),
+	}
+
+	policy := &policiesv1beta1.GeneratingPolicy{
+		ObjectMeta: metav1.ObjectMeta{Name: policyName},
+		Spec: policiesv1beta1.GeneratingPolicySpec{
+			EvaluationConfiguration: &policiesv1beta1.GeneratingPolicyEvaluationConfiguration{
+				SynchronizationConfiguration: &policiesv1beta1.SynchronizationConfiguration{Enabled: ptr.To(true)},
+			},
+		},
+	}
+	statusRecorder := &recordingStatusControl{}
+	controller := &CELGenerateController{
+		client:        client,
+		restMapper:    mapper,
+		context:       libs.NewFakeContextProvider(),
+		engine:        &testEngine{generated: []*unstructured.Unstructured{downstreamNew}},
+		provider:      &testProvider{policy: gpolengine.Policy{Policy: policy}},
+		watchManager:  wm,
+		statusControl: statusRecorder,
+		eventGen:      testEventGen{},
+		log:           logging.WithName("test-gpol-controller"),
+	}
+
+	ur := &kyvernov2.UpdateRequest{
+		ObjectMeta: metav1.ObjectMeta{Name: "ur-sync-race"},
+		Spec: kyvernov2.UpdateRequestSpec{
+			Type:   kyvernov2.CELGenerate,
+			Policy: policyName,
+			Context: kyvernov2.UpdateRequestSpecContext{
+				// Mirrors the real "modify the trigger" step of the chainsaw
+				// scenario (an UPDATE admission request drives the UR): without
+				// this, ProcessUR resolves the trigger's own GVR via
+				// c.restMapper.RESTMapping(...) synchronously on the main path
+				// (generate_controller.go, before the engine even runs), and
+				// since the trigger here is also a Secret, that call would hit
+				// the SAME mocked RESTMapper as SyncWatchers' call below and
+				// confound the two -- this test's mock must only ever see the
+				// ONE RESTMapping call that matters (SyncWatchers', for the
+				// generated downstream), not an unrelated one for the trigger.
+				AdmissionRequestInfo: kyvernov2.AdmissionRequestInfoObject{
+					AdmissionRequest: &admissionv1.AdmissionRequest{Operation: admissionv1.Update},
+					Operation:        admissionv1.Update,
+				},
+			},
+			RuleContext: []kyvernov2.RuleContext{{
+				Rule:        "rule",
+				Synchronize: true,
+				// Deliberately no UID: with one set, common.GetTrigger routes
+				// through common.GetResource's ListResource-by-UID branch, and
+				// triggerClient (like the real production dclient wiring, and
+				// like TestProcessUR_ErrorResultMarksURFailed below) only
+				// overrides GetResource, not ListResource -- matches the same
+				// UID-less pattern that test already uses for the same reason.
+				Trigger: kyvernov1.ResourceSpec{
+					APIVersion: trigger.GetAPIVersion(),
+					Kind:       trigger.GetKind(),
+					Namespace:  trigger.GetNamespace(),
+					Name:       trigger.GetName(),
+				},
+			}},
+		},
+	}
+
+	// Run ProcessUR on its own goroutine so its return can be observed via
+	// select instead of being awaited directly -- the point of this test is
+	// precisely whether it returns before or only after SyncWatchers'
+	// (mocked) RESTMapping call is released.
+	done := make(chan error, 1)
+	go func() {
+		done <- controller.ProcessUR(ur)
+	}()
+
+	select {
+	case err := <-done:
+		// ProcessUR returned WITHOUT us ever releasing the mocked RESTMapping
+		// call inside SyncWatchers. It cannot have waited for SyncWatchers to
+		// finish, so the watcher cache is not guaranteed to reflect this write
+		// by the time callers (e.g. the webhook handler) see ProcessUR return.
+		// This is deterministic regardless of CPU contention: it is not a
+		// timing race, it is proof that the return value does not depend on
+		// release at all.
+		unblockMock()
+		require.NoError(t, err)
+		t.Fatal("ProcessUR returned before SyncWatchers (still blocked on the mocked RESTMapping call) could complete -- the cache refresh runs in a detached goroutine (`go func(...) { c.watchManager.SyncWatchers(...) }`), leaving a window where a watch event for this same write is reverted as user tampering (see TestDynamicWatcher_HandleUpdateRevertsOwnWriteDuringStaleCacheWindow)")
+	case <-time.After(3 * time.Second):
+		// ProcessUR has not returned: SyncWatchers must be running inline and
+		// blocked on the mocked RESTMapping call. Release it and confirm
+		// ProcessUR then completes, with the cache already synchronized.
+		unblockMock()
+		select {
+		case err := <-done:
+			require.NoError(t, err)
+		case <-time.After(3 * time.Second):
+			t.Fatal("ProcessUR did not return even after releasing the mocked RESTMapping call")
+		}
+	}
+
+	require.False(t, statusRecorder.failed, "UR must not be marked Failed: %s", statusRecorder.message)
+	wm.lock.Lock()
+	hash := wm.dynamicWatchers[secretGVR].metadataCache[downstreamOld.GetUID()].Hash
+	wm.lock.Unlock()
+	assert.Equal(t, reportutils.CalculateResourceHash(*downstreamNew), hash,
+		"the watcher cache must reflect the new content once ProcessUR has fully completed (including its SyncWatchers dispatch)")
 }
 
 // Regression test for kyverno/kyverno#16983: when the engine evaluation

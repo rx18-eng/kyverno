@@ -188,23 +188,34 @@ func (c *CELGenerateController) ProcessUR(ur *kyvernov2.UpdateRequest) error {
 				if res.Result.Status() == engineapi.RuleStatusPass &&
 					isSync &&
 					(!ur.Spec.RuleContext[i].CacheRestore || len(resourcesToSync) > 0) {
-					// Pass resourcesToSync, the trigger and the synchronize flag as
-					// arguments to safely capture per-iteration copies for the goroutine
-					go func(resources []*unstructured.Unstructured, trigger kyvernov1.ResourceSpec, synchronize bool) {
-						if len(resources) > 0 {
-							if err := c.watchManager.SyncWatchers(ur.Spec.GetPolicyKey(), &trigger, resources); err != nil {
-								logger.Error(err, "failed to sync watchers for generated resources", "gpol", ur.Spec.GetPolicyKey())
-							} else {
-								logger.V(4).Info("synced watchers for generated resources", "gpol", ur.Spec.GetPolicyKey())
-							}
+					// Called synchronously, not dispatched in a goroutine: the
+					// watcher's metadata cache must be refreshed with this
+					// write's hash before ProcessUR returns. Otherwise the watch
+					// event for this very write can reach handleUpdate
+					// (dynamic_watcher.go) while the cache still holds the
+					// pre-update hash, and handleUpdate has no way to tell that
+					// apart from a real user modifying the downstream -- it
+					// reverts it back to the stale content (see the
+					// generating-policies/clone/sync/sync-modify-trigger
+					// conformance scenario). For the common case (a GVR that already has a
+					// running watcher) this adds one RESTMapping call, which is
+					// normally served from the mapper's warm cache; the more
+					// expensive List only happens on first-watcher creation,
+					// which this code path does not add to the hot path any
+					// more than it already was.
+					if len(resourcesToSync) > 0 {
+						if err := c.watchManager.SyncWatchers(ur.Spec.GetPolicyKey(), &ur.Spec.RuleContext[i].Trigger, resourcesToSync); err != nil {
+							logger.Error(err, "failed to sync watchers for generated resources", "gpol", ur.Spec.GetPolicyKey())
+						} else {
+							logger.V(4).Info("synced watchers for generated resources", "gpol", ur.Spec.GetPolicyKey())
 						}
-						if synchronize {
-							// the trigger was updated: delete downstream resources that were
-							// previously generated for it but are no longer part of the
-							// desired set of generated resources.
-							c.watchManager.CleanupStaleDownstreams(ur.Spec.GetPolicyKey(), &trigger, resources)
-						}
-					}(resourcesToSync, ur.Spec.RuleContext[i].Trigger, ur.Spec.RuleContext[i].Synchronize)
+					}
+					if ur.Spec.RuleContext[i].Synchronize {
+						// the trigger was updated: delete downstream resources that were
+						// previously generated for it but are no longer part of the
+						// desired set of generated resources.
+						c.watchManager.CleanupStaleDownstreams(ur.Spec.GetPolicyKey(), &ur.Spec.RuleContext[i].Trigger, resourcesToSync)
+					}
 				}
 			}
 			if err := c.audit(context.TODO(), engineResponse, generatedResources); err != nil {
