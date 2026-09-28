@@ -16,7 +16,9 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/discovery"
+	"k8s.io/client-go/discovery/cached/memory"
 	metadatainformer "k8s.io/client-go/metadata/metadatainformer"
+	"k8s.io/client-go/restmapper"
 	"k8s.io/client-go/tools/cache"
 )
 
@@ -73,6 +75,16 @@ type serverResources struct {
 	mapper       meta.ResettableRESTMapper
 	mux          sync.RWMutex
 	callbacks    []func()
+}
+
+// NewServerResourcesDiscovery builds an IDiscovery over the given delegate,
+// the same memory-cached wiring NewClient uses for a real connection.
+func NewServerResourcesDiscovery(delegate discovery.DiscoveryInterface) IDiscovery {
+	cachedClient := memory.NewMemCacheClient(delegate)
+	return &serverResources{
+		cachedClient: cachedClient,
+		mapper:       restmapper.NewDeferredDiscoveryRESTMapper(cachedClient),
+	}
 }
 
 func (c *serverResources) RESTMapper() meta.RESTMapper {

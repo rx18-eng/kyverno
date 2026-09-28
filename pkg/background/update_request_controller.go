@@ -3,6 +3,7 @@ package background
 import (
 	"context"
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	kyvernov1 "github.com/kyverno/kyverno/api/kyverno/v1"
@@ -74,6 +75,10 @@ type controller struct {
 	eventGen      event.Interface
 	configuration config.Configuration
 	jp            jmespath.Interface
+
+	// lastDiscoveryInvalidate rate-limits invalidateDiscoveryForRetry
+	// (unix nano; 0 means never).
+	lastDiscoveryInvalidate atomic.Int64
 }
 
 // NewController returns an instance of the Generate-Request Controller
@@ -240,10 +245,72 @@ func (c *controller) addUR(obj interface{}) {
 
 func (c *controller) updateUR(_, cur interface{}) {
 	curUr := cur.(*kyvernov2.UpdateRequest)
-	if curUr.Status.State == kyvernov2.Skip || curUr.Status.State == kyvernov2.Completed {
+	// Only Pending needs work; Failed always flips back to Pending in the
+	// same sync cycle, so enqueuing it too would skip the backoff below.
+	if curUr.Status.State != kyvernov2.Pending {
+		return
+	}
+	// A retry (RetryCount > 0) backs off instead of an immediate re-enqueue.
+	if curUr.Status.RetryCount > 0 {
+		key, err := cache.MetaNamespaceKeyFunc(curUr)
+		if err != nil {
+			logger.Error(err, "failed to extract name")
+			return
+		}
+		c.invalidateDiscoveryForRetry()
+		delay := defaultRetryBackoff(curUr.Status.RetryCount)
+		logger.V(3).Info("retrying update request with backoff", "key", key, "retryCount", curUr.Status.RetryCount, "delay", delay)
+		c.queue.AddAfter(key, delay)
 		return
 	}
 	c.enqueueUpdateRequest(curUr)
+}
+
+// discoveryInvalidateWindow caps invalidateDiscoveryForRetry to once per
+// window, process-wide, so many concurrently-retrying URs can't storm it.
+const discoveryInvalidateWindow = time.Second
+
+// invalidateDiscoveryForRetry forces the next discovery lookup to hit the
+// server: a cached-but-stale discovery client never retries on its own.
+func (c *controller) invalidateDiscoveryForRetry() {
+	if c.client == nil {
+		return
+	}
+	now := time.Now().UnixNano()
+	last := c.lastDiscoveryInvalidate.Load()
+	if now-last < discoveryInvalidateWindow.Nanoseconds() {
+		return
+	}
+	if !c.lastDiscoveryInvalidate.CompareAndSwap(last, now) {
+		return
+	}
+	disco := c.client.Discovery()
+	if disco == nil {
+		return
+	}
+	if cached := disco.CachedDiscoveryInterface(); cached != nil {
+		cached.Invalidate()
+	}
+	if mapper, ok := disco.RESTMapper().(meta.ResettableRESTMapper); ok {
+		mapper.Reset()
+	}
+}
+
+// defaultRetryBackoff paces UR retries (300ms, 600ms, 1.2s..., capped at
+// 10s) against retryOrDeleteOnFailure's RetryCount>3 delete threshold.
+func defaultRetryBackoff(retryCount int) time.Duration {
+	const (
+		base     = 300 * time.Millisecond
+		maxDelay = 10 * time.Second
+	)
+	d := base
+	for i := 1; i < retryCount; i++ {
+		d *= 2
+		if d >= maxDelay {
+			return maxDelay
+		}
+	}
+	return d
 }
 
 func (c *controller) processUR(ur *kyvernov2.UpdateRequest) error {
