@@ -1452,6 +1452,107 @@ func TestHandleUpdate(t *testing.T) {
 		wm.handleUpdate(updated, gvr)
 		assert.Empty(t, client.updated)
 	})
+
+	// Regression coverage for the generating-policies/clone/sync/sync-modify-trigger
+	// and data/sync/sync-update-trigger-in-place conformance scenarios: the write
+	// GenerateResources makes to a downstream lands before SyncWatchers can refresh
+	// the watcher's cache with its hash (SyncWatchers only runs once ProcessUR's
+	// call to engine.Handle, which performs the write, has already returned), so a
+	// watch event for that very write can reach handleUpdate while the cache still
+	// holds the pre-write hash. BeginGenerate/end lets ProcessUR mark that window so
+	// handleUpdate treats a mismatch on it as its own pending write, not tampering.
+	t.Run("in-flight generate write is not reverted", func(t *testing.T) {
+		policyName := "generate-secret"
+		triggerUID := types.UID("trigger-uid-1")
+		labels := map[string]string{
+			common.GeneratePolicyLabel:     policyName,
+			common.GenerateTriggerUIDLabel: string(triggerUID),
+		}
+		cached := makeObj("down-uid", "down-pod", "default", labels)
+		cachedHash := reportutils.CalculateResourceHash(*cached)
+		// The live object already carries Kyverno's own new content; the cache
+		// hasn't caught up yet, mirroring the write-before-cache-refresh gap.
+		live := cached.DeepCopy()
+		live.SetAnnotations(map[string]string{"tier": "free"})
+
+		client := &MockClient{}
+		wm := &WatchManager{
+			log:    logging.WithName("test"),
+			client: client,
+			dynamicWatchers: map[schema.GroupVersionResource]*watcher{
+				gvr: {metadataCache: map[types.UID]Resource{
+					"down-uid": {Name: cached.GetName(), Namespace: cached.GetNamespace(), Labels: labels, Hash: cachedHash, Data: cached},
+				}},
+			},
+		}
+
+		end := wm.BeginGenerate(policyName, triggerUID)
+		wm.handleUpdate(live, gvr)
+		assert.Empty(t, client.updated, "a write Kyverno is still making for this trigger must not be reverted")
+		end()
+	})
+
+	t.Run("revert still applies once the generate write completes", func(t *testing.T) {
+		policyName := "generate-secret"
+		triggerUID := types.UID("trigger-uid-1")
+		labels := map[string]string{
+			common.GeneratePolicyLabel:     policyName,
+			common.GenerateTriggerUIDLabel: string(triggerUID),
+		}
+		cached := makeObj("down-uid", "down-pod", "default", labels)
+		cachedHash := reportutils.CalculateResourceHash(*cached)
+		live := cached.DeepCopy()
+		live.SetAnnotations(map[string]string{"tampered": "true"})
+
+		client := &MockClient{}
+		wm := &WatchManager{
+			log:    logging.WithName("test"),
+			client: client,
+			dynamicWatchers: map[schema.GroupVersionResource]*watcher{
+				gvr: {metadataCache: map[types.UID]Resource{
+					"down-uid": {Name: cached.GetName(), Namespace: cached.GetNamespace(), Labels: labels, Hash: cachedHash, Data: cached},
+				}},
+			},
+		}
+
+		end := wm.BeginGenerate(policyName, triggerUID)
+		end()
+		wm.handleUpdate(live, gvr)
+		assert.NotEmpty(t, client.updated, "once the generate write is no longer in flight, real drift must still be reverted")
+	})
+
+	t.Run("BeginGenerate ref-counts overlapping writes for the same trigger", func(t *testing.T) {
+		policyName := "generate-secret"
+		triggerUID := types.UID("trigger-uid-1")
+		labels := map[string]string{
+			common.GeneratePolicyLabel:     policyName,
+			common.GenerateTriggerUIDLabel: string(triggerUID),
+		}
+		cached := makeObj("down-uid", "down-pod", "default", labels)
+		cachedHash := reportutils.CalculateResourceHash(*cached)
+		live := cached.DeepCopy()
+		live.SetAnnotations(map[string]string{"tampered": "true"})
+
+		client := &MockClient{}
+		wm := &WatchManager{
+			log:    logging.WithName("test"),
+			client: client,
+			dynamicWatchers: map[schema.GroupVersionResource]*watcher{
+				gvr: {metadataCache: map[types.UID]Resource{
+					"down-uid": {Name: cached.GetName(), Namespace: cached.GetNamespace(), Labels: labels, Hash: cachedHash, Data: cached},
+				}},
+			},
+		}
+
+		end1 := wm.BeginGenerate(policyName, triggerUID)
+		end2 := wm.BeginGenerate(policyName, triggerUID)
+		end1()
+		wm.handleUpdate(live, gvr)
+		assert.Empty(t, client.updated, "still in flight: one BeginGenerate call is still outstanding")
+		end2()
+		wm.handleUpdate(live, gvr)
+		assert.NotEmpty(t, client.updated, "no longer in flight: both BeginGenerate calls have ended")
+	})
 }
 
 func TestWatchManager_CacheIntegrity(t *testing.T) {

@@ -44,6 +44,10 @@ type WatchManager struct {
 	policyRefs map[string][]schema.GroupVersionResource
 	// refCount tracks the number of policies that generates the same resource.
 	refCount map[schema.GroupVersionResource]int
+	// pendingGenerates ref-counts, per policy/trigger, a generate write that is
+	// currently being applied but not yet reflected in the metadata cache. See
+	// BeginGenerate.
+	pendingGenerates map[string]int
 
 	log  logr.Logger
 	lock sync.Mutex
@@ -61,12 +65,45 @@ func NewWatchManager(log logr.Logger, client dclient.Interface) *WatchManager {
 		restMapper = meta.NewDefaultRESTMapper(nil)
 	}
 	return &WatchManager{
-		log:             log,
-		client:          client,
-		restMapper:      restMapper,
-		dynamicWatchers: map[schema.GroupVersionResource]*watcher{},
-		policyRefs:      map[string][]schema.GroupVersionResource{},
-		refCount:        map[schema.GroupVersionResource]int{},
+		log:              log,
+		client:           client,
+		restMapper:       restMapper,
+		dynamicWatchers:  map[schema.GroupVersionResource]*watcher{},
+		policyRefs:       map[string][]schema.GroupVersionResource{},
+		refCount:         map[schema.GroupVersionResource]int{},
+		pendingGenerates: map[string]int{},
+	}
+}
+
+// generateKey identifies a policy/trigger pair for pendingGenerates, matching
+// the (GeneratePolicyLabel, GenerateTriggerUIDLabel) pair already used to
+// attribute a cached downstream resource to the generate call that produced it.
+func generateKey(policyName string, triggerUID types.UID) string {
+	return policyName + "/" + string(triggerUID)
+}
+
+// BeginGenerate marks a generate write for the given policy/trigger as in
+// flight, so handleUpdate treats a hash mismatch on that trigger's downstream
+// as its own pending write rather than user tampering until the returned
+// function is called. Ref-counted: two overlapping generate calls for the
+// same policy/trigger don't unmark it early.
+func (wm *WatchManager) BeginGenerate(policyName string, triggerUID types.UID) func() {
+	key := generateKey(policyName, triggerUID)
+	wm.lock.Lock()
+	if wm.pendingGenerates == nil {
+		wm.pendingGenerates = map[string]int{}
+	}
+	wm.pendingGenerates[key]++
+	wm.lock.Unlock()
+	return func() {
+		wm.lock.Lock()
+		if wm.pendingGenerates[key] > 0 {
+			wm.pendingGenerates[key]--
+			if wm.pendingGenerates[key] == 0 {
+				delete(wm.pendingGenerates, key)
+			}
+		}
+		wm.lock.Unlock()
 	}
 }
 
@@ -574,6 +611,15 @@ func (wm *WatchManager) handleUpdate(obj *unstructured.Unstructured, gvr schema.
 			// if the cached resource has not been invalidated and is different from the hash of the resource,
 			// then we need to revert the downstream resource as it means that it has been updated by the user.
 			if hash != "" && hash != reportutils.CalculateResourceHash(*obj) {
+				cachedLabels := watcher.metadataCache[uid].Labels
+				key := generateKey(cachedLabels[common.GeneratePolicyLabel], types.UID(cachedLabels[common.GenerateTriggerUIDLabel]))
+				if wm.pendingGenerates[key] > 0 {
+					// A generate write for this trigger is still in flight (see
+					// BeginGenerate): this is Kyverno's own new content racing
+					// the cache refresh that follows it, not user tampering.
+					wm.log.V(4).Info("downstream resource changed while its own generate write is in flight, skipping revert", "name", obj.GetName(), "namespace", obj.GetNamespace())
+					return
+				}
 				wm.log.V(4).Info("downstream resource updated by user, reverting changes", "name", obj.GetName(), "namespace", obj.GetNamespace())
 				// create a copy of the resource to avoid modifying the cache
 				downstream := watcher.metadataCache[uid].Data.DeepCopy()

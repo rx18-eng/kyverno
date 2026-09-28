@@ -140,8 +140,12 @@ func (c *CELGenerateController) ProcessUR(ur *kyvernov2.UpdateRequest) error {
 			continue
 		}
 		isSync := policy.Policy.GetSpec().SynchronizationEnabled()
+		// Covers engine.Handle's write and the SyncWatchers call below that
+		// catches its cache up -- see WatchManager.BeginGenerate.
+		endGenerate := c.watchManager.BeginGenerate(ur.Spec.GetPolicyKey(), ur.Spec.RuleContext[i].Trigger.UID)
 		gpolResponse, err := c.engine.Handle(request, policy, ur.Spec.RuleContext[i].CacheRestore)
 		if err != nil {
+			endGenerate()
 			logger.Error(err, "failed to generate resources for gpol", "gpol", ur.Spec.GetPolicyKey())
 			failures = append(failures, fmt.Errorf("gpol %s failed: %v", ur.Spec.GetPolicyKey(), err))
 			continue
@@ -226,6 +230,7 @@ func (c *CELGenerateController) ProcessUR(ur *kyvernov2.UpdateRequest) error {
 				reportableEngineResponses = append(reportableEngineResponses, engineResponse)
 			}
 		}
+		endGenerate()
 		if c.needsReports(*trigger) && len(reportableEngineResponses) > 0 {
 			if err := c.createReports(context.TODO(), *trigger, reportableEngineResponses...); err != nil {
 				c.log.Error(err, "failed to create report")
