@@ -711,3 +711,88 @@ func TestProcess_TargetChangedDuringEvaluation_KeepsTheOtherWrite(t *testing.T) 
 	assert.NoError(t, err)
 	assert.Equal(t, map[string]string{"b": "2"}, data)
 }
+
+// notCompiledEngine models the mpol engine before its reconciler has loaded a
+// newly created policy: it doesn't know the policy and evaluates nothing.
+type notCompiledEngine struct {
+	fakeEngine
+	evaluated bool
+}
+
+func (e *notCompiledEngine) GetCompiledPolicy(policyName string) (mpolengine.Policy, error) {
+	return mpolengine.Policy{}, errors.New("policy with name " + policyName + " wasn't found")
+}
+
+func (e *notCompiledEngine) Evaluate(_ context.Context, attr admission.Attributes, _ admissionv1.AdmissionRequest, _ mpolengine.Predicate) (mpolengine.EngineResponse, error) {
+	e.evaluated = true
+	obj, _ := attr.GetObject().(*unstructured.Unstructured)
+	return mpolengine.EngineResponse{Resource: obj}, nil
+}
+
+func TestProcess_PolicyNotYetCompiled_FailsTheUpdateRequestForRetry(t *testing.T) {
+	scheme := runtime.NewScheme()
+	for _, kind := range []string{"ConfigMap", "Namespace"} {
+		scheme.AddKnownTypeWithName(schema.GroupVersionKind{Group: "", Version: "v1", Kind: kind}, &unstructured.Unstructured{})
+		scheme.AddKnownTypeWithName(schema.GroupVersionKind{Group: "", Version: "v1", Kind: kind + "List"}, &unstructured.UnstructuredList{})
+	}
+	ns := &unstructured.Unstructured{}
+	ns.SetAPIVersion("v1")
+	ns.SetKind("Namespace")
+	ns.SetName("test-nmpol-background-scan-ns")
+	cm := &unstructured.Unstructured{}
+	cm.SetAPIVersion("v1")
+	cm.SetKind("ConfigMap")
+	cm.SetNamespace("test-nmpol-background-scan-ns")
+	cm.SetName("test-nmpol-background-scan-cm")
+	gvrToListKind := map[schema.GroupVersionResource]string{
+		{Group: "", Version: "v1", Resource: "configmaps"}: "ConfigMapList",
+		{Group: "", Version: "v1", Resource: "namespaces"}: "NamespaceList",
+	}
+	fakeClient, err := dclient.NewFakeClient(scheme, gvrToListKind, ns, cm)
+	assert.NoError(t, err)
+	fakeClient.SetDiscovery(dclient.NewFakeDiscoveryClient(nil))
+
+	admissionEnabled, mutateExisting := false, true
+	kyvernoClient := fake.NewSimpleClientset(
+		&policiesv1beta1.NamespacedMutatingPolicy{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-nmpol-background-scan", Namespace: "test-nmpol-background-scan-ns"},
+			Spec: policiesv1beta1.MutatingPolicySpec{
+				EvaluationConfiguration: &policiesv1beta1.MutatingPolicyEvaluationConfiguration{
+					Admission:                   &policiesv1beta1.AdmissionConfiguration{Enabled: &admissionEnabled},
+					MutateExistingConfiguration: &policiesv1beta1.MutateExistingConfiguration{Enabled: &mutateExisting},
+				},
+				MatchConstraints: &admissionregistrationv1.MatchResources{
+					ResourceRules: []admissionregistrationv1.NamedRuleWithOperations{{
+						ResourceNames: []string{"test-nmpol-background-scan-cm"},
+						RuleWithOperations: admissionregistrationv1alpha1.RuleWithOperations{
+							Operations: []admissionregistrationv1.OperationType{admissionregistrationv1.Create, admissionregistrationv1.Update},
+							Rule: admissionregistrationv1alpha1.Rule{
+								APIGroups:   []string{""},
+								APIVersions: []string{"v1"},
+								Resources:   []string{"configmaps"},
+							},
+						},
+					}},
+				},
+			},
+		},
+	)
+	restMapper := meta.NewDefaultRESTMapper([]schema.GroupVersion{{Group: "", Version: "v1"}})
+	restMapper.Add(schema.GroupVersionKind{Group: "", Version: "v1", Kind: "ConfigMap"}, meta.RESTScopeNamespace)
+
+	eng := &notCompiledEngine{}
+	sc := &fakeStatusControl{}
+	p := NewProcessor(fakeClient, kyvernoClient, eng, restMapper, &libs.FakeContextProvider{}, sc, event.NewFake(), config.NewDefaultConfiguration(false))
+
+	// the update request the policy controller creates when the policy is created
+	ur := &kyvernov2.UpdateRequest{
+		ObjectMeta: metav1.ObjectMeta{Name: "ur-policy-event", Namespace: "kyverno"},
+		Spec: kyvernov2.UpdateRequestSpec{
+			Type:   kyvernov2.CELMutate,
+			Policy: "test-nmpol-background-scan-ns/test-nmpol-background-scan",
+		},
+	}
+	assert.NoError(t, p.Process(ur))
+	assert.True(t, sc.failedCalled, "the scan must be retried once the engine has the policy")
+	assert.False(t, sc.successCalled, "a scan that evaluated nothing must not be marked completed")
+}

@@ -107,6 +107,11 @@ func (p *processor) Process(ur *kyvernov2.UpdateRequest) error {
 	if mpol == nil {
 		return err
 	}
+	// The request for a new policy can arrive before the engine has compiled that policy; fail it
+	// so it is retried, since evaluating now would match nothing and complete it silently.
+	if _, err := p.engine.GetCompiledPolicy(mpolengine.PolicyKey(mpol)); err != nil {
+		return updateURStatus(p.statusControl, *ur, err, nil)
+	}
 
 	targetConstraints := mpol.GetMatchConstraints()
 	if len(mpol.GetTargetMatchConstraints().ResourceRules) != 0 && mpol.GetTargetMatchConstraints().Expression == "" {
