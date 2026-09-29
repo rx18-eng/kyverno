@@ -9,6 +9,7 @@ on:
     branches:
       - main
       - release-*
+      - ci-test/** # TEST-ONLY: fork test branches
 
 concurrency:
   group: ${{ github.workflow_ref }}
@@ -94,7 +95,7 @@ jobs:
         run: make check-perf
 
   sync-issue:
-    if: always() && github.event_name == 'push'
+    if: false # TEST-ONLY: do not open failure issues on the fork
     needs:
       - images
       - cli
