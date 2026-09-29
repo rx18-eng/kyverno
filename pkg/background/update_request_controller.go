@@ -245,13 +245,12 @@ func (c *controller) addUR(obj interface{}) {
 
 func (c *controller) updateUR(_, cur interface{}) {
 	curUr := cur.(*kyvernov2.UpdateRequest)
-	// Only Pending needs work; Failed always flips back to Pending in the
-	// same sync cycle, so enqueuing it too would skip the backoff below.
-	if curUr.Status.State != kyvernov2.Pending {
+	if curUr.Status.State == kyvernov2.Skip || curUr.Status.State == kyvernov2.Completed {
 		return
 	}
-	// A retry (RetryCount > 0) backs off instead of an immediate re-enqueue.
-	if curUr.Status.RetryCount > 0 {
+	// A retry (a Failed UR, or a Pending one with RetryCount > 0) backs off
+	// instead of an immediate re-enqueue.
+	if curUr.Status.State == kyvernov2.Failed || curUr.Status.RetryCount > 0 {
 		key, err := cache.MetaNamespaceKeyFunc(curUr)
 		if err != nil {
 			logger.Error(err, "failed to extract name")
