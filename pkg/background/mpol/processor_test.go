@@ -619,3 +619,95 @@ func TestProcess_TargetExpressionInvalidURMarksFailed(t *testing.T) {
 	assert.NoError(t, err)
 	assert.True(t, sc.failedCalled, "expected UR to be marked failed for invalid expression input")
 }
+
+// removeKeyEngine mutates whatever object it is given, the way a real policy
+// does: it drops data["a"]. onFirstEvaluate lets a test land a write from
+// someone else while the policy is being evaluated.
+type removeKeyEngine struct {
+	fakeEngine
+	onFirstEvaluate func()
+	calls           int
+}
+
+func (e *removeKeyEngine) Evaluate(_ context.Context, attr admission.Attributes, _ admissionv1.AdmissionRequest, _ mpolengine.Predicate) (mpolengine.EngineResponse, error) {
+	e.calls++
+	if e.calls == 1 && e.onFirstEvaluate != nil {
+		e.onFirstEvaluate()
+	}
+	obj := attr.GetObject().(*unstructured.Unstructured)
+	patched := obj.DeepCopy()
+	unstructured.RemoveNestedField(patched.Object, "data", "a")
+	return mpolengine.EngineResponse{Resource: obj, PatchedResource: patched}, nil
+}
+
+func TestProcess_TargetChangedDuringEvaluation_KeepsTheOtherWrite(t *testing.T) {
+	ctx := context.Background()
+	scheme := runtime.NewScheme()
+	scheme.AddKnownTypeWithName(schema.GroupVersionKind{Group: "", Version: "v1", Kind: "ConfigMap"}, &unstructured.Unstructured{})
+	scheme.AddKnownTypeWithName(schema.GroupVersionKind{Group: "", Version: "v1", Kind: "ConfigMapList"}, &unstructured.UnstructuredList{})
+	cm := &unstructured.Unstructured{}
+	cm.SetAPIVersion("v1")
+	cm.SetKind("ConfigMap")
+	cm.SetNamespace("shared")
+	cm.SetName("shared-cm")
+	assert.NoError(t, unstructured.SetNestedStringMap(cm.Object, map[string]string{"a": "1"}, "data"))
+	gvrToListKind := map[schema.GroupVersionResource]string{
+		{Group: "", Version: "v1", Resource: "configmaps"}: "ConfigMapList",
+	}
+	fakeClient, err := dclient.NewFakeClient(scheme, gvrToListKind, cm)
+	assert.NoError(t, err)
+	fakeClient.SetDiscovery(dclient.NewFakeDiscoveryClient(nil))
+
+	kyvernoClient := fake.NewSimpleClientset(
+		&policiesv1beta1.MutatingPolicy{
+			ObjectMeta: metav1.ObjectMeta{Name: "remove-a"},
+			Spec: policiesv1beta1.MutatingPolicySpec{
+				MatchConstraints: &admissionregistrationv1.MatchResources{
+					ResourceRules: []admissionregistrationv1.NamedRuleWithOperations{{
+						RuleWithOperations: admissionregistrationv1alpha1.RuleWithOperations{
+							Rule: admissionregistrationv1alpha1.Rule{
+								APIGroups:   []string{""},
+								APIVersions: []string{"v1"},
+								Resources:   []string{"configmaps"},
+							},
+						},
+					}},
+				},
+			},
+		},
+	)
+	restMapper := meta.NewDefaultRESTMapper([]schema.GroupVersion{{Group: "", Version: "v1"}})
+	restMapper.Add(schema.GroupVersionKind{Group: "", Version: "v1", Kind: "ConfigMap"}, meta.RESTScopeNamespace)
+
+	// Another writer adds data["b"] after the target was listed but before
+	// the policy's change is written back.
+	eng := &removeKeyEngine{onFirstEvaluate: func() {
+		live, err := fakeClient.GetResource(ctx, "v1", "ConfigMap", "shared", "shared-cm")
+		assert.NoError(t, err)
+		assert.NoError(t, unstructured.SetNestedField(live.Object, "2", "data", "b"))
+		_, err = fakeClient.UpdateResource(ctx, "v1", "ConfigMap", "shared", live.Object, false)
+		assert.NoError(t, err)
+	}}
+	p := NewProcessor(
+		fakeClient,
+		kyvernoClient,
+		eng,
+		restMapper,
+		&libs.FakeContextProvider{},
+		&fakeStatusControl{},
+		event.NewFake(),
+		config.NewDefaultConfiguration(false),
+	)
+
+	ur := &kyvernov2.UpdateRequest{
+		ObjectMeta: metav1.ObjectMeta{Name: "ur-concurrent-write", Namespace: "kyverno"},
+		Spec:       kyvernov2.UpdateRequestSpec{Policy: "remove-a"},
+	}
+	assert.NoError(t, p.Process(ur))
+
+	final, err := fakeClient.GetResource(ctx, "v1", "ConfigMap", "shared", "shared-cm")
+	assert.NoError(t, err)
+	data, _, err := unstructured.NestedStringMap(final.Object, "data")
+	assert.NoError(t, err)
+	assert.Equal(t, map[string]string{"b": "2"}, data)
+}
