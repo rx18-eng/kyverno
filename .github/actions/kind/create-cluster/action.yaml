@@ -1,0 +1,47 @@
+# yaml-language-server: $schema=https://json.schemastore.org/github-action.json
+
+name: Create kind cluster
+description: Create a kind cluster, retrying once if the kind download or the cluster creation fails
+
+inputs:
+  node-image:
+    description: kind node image
+    required: true
+  config:
+    description: kind config file
+    required: false
+    default: ./scripts/config/kind/default.yaml
+  cluster-name:
+    description: kind cluster name
+    required: false
+    default: kind
+
+runs:
+  using: composite
+  steps:
+    # The kind binary is downloaded from GitHub releases, which fails now and then on the
+    # runners (for example a checksum file that comes back empty), so retry once.
+    - name: Create kind cluster
+      id: kind
+      uses: helm/kind-action@06c1ae10762d3b9c1644e7fe69596ae519e015a2 # v1.15.0
+      continue-on-error: true
+      with:
+        node_image: ${{ inputs.node-image }}
+        cluster_name: ${{ inputs.cluster-name }}
+        config: ${{ inputs.config }}
+    - name: Clean up the failed kind cluster
+      if: steps.kind.outcome == 'failure'
+      shell: bash
+      env:
+        CLUSTER_NAME: ${{ inputs.cluster-name }}
+      run: |
+        kind delete cluster --name "$CLUSTER_NAME" || true
+        # give a GitHub releases outage a moment to pass before trying again
+        sleep 30
+    - name: Create kind cluster (retry)
+      if: steps.kind.outcome == 'failure'
+      uses: helm/kind-action@06c1ae10762d3b9c1644e7fe69596ae519e015a2 # v1.15.0
+      with:
+        node_image: ${{ inputs.node-image }}
+        cluster_name: ${{ inputs.cluster-name }}
+        config: ${{ inputs.config }}
