@@ -891,3 +891,53 @@ func TestProcess_SameNamedPolicyFromAnotherScope_DoesNotCountAsCompiled(t *testi
 	assert.False(t, sc.successCalled)
 	assert.False(t, eng.evaluated)
 }
+
+// A policy update creates an update request right away, and the engine can still hold the
+// previous version of the policy when it is processed. Evaluating then applies the old
+// mutation and completes the request, so existing targets never get the new one.
+func TestProcess_PolicyUpdatedBeforeEngineRecompiled(t *testing.T) {
+	tests := []struct {
+		name               string
+		compiledGeneration int64
+		wantRetry          bool
+	}{{
+		name:               "engine still holds the previous version",
+		compiledGeneration: 1,
+		wantRetry:          true,
+	}, {
+		name:               "engine holds the updated version",
+		compiledGeneration: 2,
+	}, {
+		name:               "engine already holds a newer version",
+		compiledGeneration: 3,
+	}}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mpol := &policiesv1beta1.MutatingPolicy{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-nmpol-background-scan", Generation: 2},
+				Spec:       backgroundScanSpec(),
+			}
+			compiled := mpol.DeepCopy()
+			compiled.Generation = tt.compiledGeneration
+			fakeClient, kyvernoClient, restMapper := newBackgroundScanFixture(t, mpol)
+			eng := &notCompiledEngine{compiled: compiled}
+			sc := &fakeStatusControl{}
+			p := NewProcessor(fakeClient, kyvernoClient, eng, restMapper, &libs.FakeContextProvider{}, sc, event.NewFake(), config.NewDefaultConfiguration(false))
+
+			ur := &kyvernov2.UpdateRequest{
+				ObjectMeta: metav1.ObjectMeta{Name: "ur-policy-event", Namespace: "kyverno"},
+				Spec:       kyvernov2.UpdateRequestSpec{Type: kyvernov2.CELMutate, Policy: "test-nmpol-background-scan"},
+			}
+			err := p.Process(ur)
+			if tt.wantRetry {
+				// an error (rather than a status update) lets the controller retry with backoff
+				assert.Error(t, err)
+				assert.False(t, sc.successCalled, "a scan with the previous policy version must not be marked completed")
+				assert.False(t, eng.evaluated)
+			} else {
+				assert.NoError(t, err)
+				assert.True(t, eng.evaluated)
+			}
+		})
+	}
+}
