@@ -9,6 +9,7 @@ on:
     branches:
       - main
       - release-*
+      - ci-test/** # TEST-ONLY: fork test branches
   # Re-runs the suite on the latest commit without a push, e.g. after a fix
   # landed in kyverno/policies or kyverno/sdk. On main and release branches it
   # updates the tracking issue like a push run, which clears the E2E gate.
@@ -103,12 +104,7 @@ jobs:
   # left as it is. A failure is still recorded even if other jobs were then
   # cancelled.
   sync-issue:
-    if: >-
-      always() &&
-      (contains(needs.*.result, 'failure') || !contains(needs.*.result, 'cancelled')) &&
-      (github.event_name == 'push' ||
-        (github.event_name == 'workflow_dispatch' &&
-          (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release-'))))
+    if: false # TEST-ONLY: do not open failure issues on the fork
     needs:
       - images
       - cli
