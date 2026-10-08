@@ -16,4 +16,7 @@ spec:
   timeouts:
     apply: 10s
     assert: 1m30s
+    # The 30s default is too short when a pod is slow to go away, for example
+    # while its image is still being pulled.
+    cleanup: 1m30s
     error: 1m30s
